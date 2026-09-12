@@ -37,6 +37,15 @@ extension has no way to learn the token. It is gated on loopback `Host` plus an 
 allowlist (no `Origin` for the desktop client; official EasyEDA web origins for the
 browser client, extendable via `EASYEDA_BRIDGE_ALLOWED_ORIGINS`).
 
+## Also added by this fork
+
+`scripts/install.sh` — provisions Node (reusing a system one, or fetching a pinned
+official build into a user-local prefix with its SHA-256 verified against
+`SHASUMS256.txt`), installs `ws` from the lockfile via `npm ci`, and registers the
+skill under `~/.claude/skills`. It prints a plan and requires an explicit `y` on a
+real terminal first; a piped stdin is refused rather than treated as consent. It
+never starts the bridge.
+
 ## Residual risk
 
 - Any process running as this user can read the token file. Same-user boundary, not a sandbox.

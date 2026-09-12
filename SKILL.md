@@ -69,6 +69,12 @@ Then proceed with the setup steps below.
 cd ${CLAUDE_SKILL_DIR} && npm install
 ```
 
+If `CLAUDE_SKILL_DIR` is not set, this skill lives at `~/.claude/skills/easyeda-api`
+(or `.claude/skills/easyeda-api` when installed per-project); use that path instead.
+
+`scripts/install.sh` does this step, provisions Node if needed, and registers the
+skill — it prints a plan and waits for confirmation before changing anything.
+
 ### 3. Start bridge server
 
 > **⚠️ IMPORTANT**: The bridge server must run in the background. Do NOT run it in the foreground, or the AI will block waiting for the server to exit.
