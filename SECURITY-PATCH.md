@@ -46,6 +46,14 @@ skill under `~/.claude/skills`. It prints a plan and requires an explicit `y` on
 real terminal first; a piped stdin is refused rather than treated as consent. It
 never starts the bridge.
 
+`SKILL.md` also gained an **Untrusted Content & Prompt Injection** section. Results from
+`/execute` carry text from shared projects, third-party library entries and document fields,
+all of it attacker-controllable, and the agent reading those results is the one component
+with no technical boundary protecting it. The section tells the agent to treat returned
+content as data, never to act on instructions embedded in it, never to place the bridge token
+in code sent to the EDA client, and to distrust results that contradict the request — since
+the un-token-gated `/eda` path means a result is not proof of what EDA actually did.
+
 ## Residual risk
 
 - Any process running as this user can read the token file. Same-user boundary, not a sandbox.
