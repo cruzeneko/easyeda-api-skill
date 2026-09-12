@@ -28,18 +28,78 @@
  *   "error": "<error message>",            // error 时
  *   "timestamp": <unix ms>
  * }
+ *
+ * ─── Security model / 安全模型 ───────────────────────────────────────
+ *
+ * This server executes arbitrary JavaScript inside the user's EasyEDA client.
+ * Anything that can reach it owns the user's designs. Four controls gate access:
+ *
+ *   1. Loopback bind (127.0.0.1) — not reachable from the network.
+ *   2. Host header allowlist — defeats DNS rebinding, where a hostile page uses
+ *      a domain that resolves to 127.0.0.1 and therefore sends no useful Origin.
+ *   3. Origin rejection — any request carrying a browser Origin is refused on the
+ *      agent-facing surfaces (HTTP API and the /agent WebSocket). CLI agents send
+ *      no Origin; web pages always do. This closes the localhost drive-by where a
+ *      site you happen to be visiting scans the port range and posts code.
+ *      The /eda path additionally accepts the official EasyEDA web origins, since
+ *      the browser-hosted EDA client legitimately connects from one.
+ *   4. Bearer token — a per-run secret required on every agent-facing surface,
+ *      written to ~/.easyeda-bridge/token (0600). The EDA extension is exempt:
+ *      it has no way to learn the token, so /eda is gated by 1-3 plus a
+ *      registration lock that stops a second client from stealing a window ID.
+ *
+ * Residual risk: any process running as this user can read the token file. This
+ * is a same-user boundary, not a sandbox.
  */
 
 import { WebSocketServer } from 'ws';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer, get as httpGet } from 'node:http';
 import { createConnection } from 'node:net';
+import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 // ─── Port Configuration ─────────────────────────────────────────────
 const PORT_START = 49620;
 const PORT_END = 49629;
 const SERVICE_ID = 'easyeda-bridge';
 const LISTEN_HOST = '127.0.0.1';
+
+// ─── Security Configuration ─────────────────────────────────────────
+/** Max accepted request body. Prevents an unbounded local memory DoS. */
+const MAX_BODY_BYTES = 1024 * 1024;
+
+/** Where the port/token handshake material is published for the local agent. */
+const STATE_DIR = join(homedir(), '.easyeda-bridge');
+const SESSION_FILE = join(STATE_DIR, 'session.json');
+const TOKEN_FILE = join(STATE_DIR, 'token');
+
+/**
+ * Per-run bearer token. Set EASYEDA_BRIDGE_TOKEN to pin a stable value
+ * (useful when the agent is started before the bridge); otherwise a fresh
+ * 256-bit secret is minted on every start.
+ */
+const AUTH_TOKEN = (process.env.EASYEDA_BRIDGE_TOKEN || '').trim() || randomBytes(32).toString('hex');
+
+/** Host header values that mean "someone typed a loopback address". */
+const ALLOWED_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+
+/**
+ * Browser origins allowed to open the EDA-facing WebSocket. The desktop client
+ * sends no Origin at all; the web client sends one of these. Extend via
+ * EASYEDA_BRIDGE_ALLOWED_ORIGINS (comma separated).
+ */
+const EDA_ALLOWED_ORIGINS = new Set([
+  'https://pro.easyeda.com',
+  'https://easyeda.com',
+  'https://pro.lceda.cn',
+  'https://lceda.cn',
+  ...(process.env.EASYEDA_BRIDGE_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean),
+]);
 
 function formatBannerLine(label, value) {
   return `║  ${`${label}:`.padEnd(12)} ${String(value).padEnd(44)}║`;
@@ -49,13 +109,203 @@ function formatBannerLine(label, value) {
 /** @type {Map<string, import('ws').WebSocket>} EDA window ID -> WebSocket */
 const edaClients = new Map();
 
-/** @type {Map<string, {resolve: Function, reject: Function, timer: NodeJS.Timeout}>} */
+/** @type {Map<string, {resolve: Function, reject: Function, timer: NodeJS.Timeout, windowId: string}>} */
 const pendingRequests = new Map();
 
 /** @type {string | null} 当前AI端选中的EDA窗口ID */
 let activeEdaWindowId = null;
 
 const REQUEST_TIMEOUT_MS = 30_000;
+
+// ─── Security Helpers ───────────────────────────────────────────────
+
+/**
+ * Verify the Host header names a loopback address.
+ * A DNS-rebinding page reaches 127.0.0.1 but carries its own hostname here.
+ * @param {string | undefined} hostHeader
+ * @returns {boolean}
+ */
+function isLoopbackHost(hostHeader) {
+  if (!hostHeader) return false;
+  const raw = String(hostHeader).trim().toLowerCase();
+  let name = raw;
+  if (raw.startsWith('[')) {
+    const close = raw.indexOf(']');
+    name = close === -1 ? raw : raw.slice(0, close + 1);
+  } else {
+    const firstColon = raw.indexOf(':');
+    if (firstColon !== -1 && firstColon === raw.lastIndexOf(':')) {
+      name = raw.slice(0, firstColon);
+    }
+  }
+  return ALLOWED_HOSTNAMES.has(name);
+}
+
+/**
+ * True when the request came from a web page. Browsers always attach Origin to
+ * cross-origin fetches and WebSocket upgrades; CLI clients attach none.
+ * "null" is the opaque origin used by sandboxed frames and data: URLs.
+ * @param {string | undefined} origin
+ * @returns {boolean}
+ */
+function isBrowserOrigin(origin) {
+  if (!origin) return false;
+  const o = String(origin).trim().toLowerCase();
+  return o === 'null' || o.startsWith('http://') || o.startsWith('https://');
+}
+
+/**
+ * @param {string | undefined} origin
+ * @returns {boolean} true if this browser origin may drive the EDA path
+ */
+function isAllowedEdaOrigin(origin) {
+  if (!origin) return true;
+  return EDA_ALLOWED_ORIGINS.has(String(origin).trim().toLowerCase());
+}
+
+/**
+ * Constant-time token comparison.
+ * @param {string | null | undefined} provided
+ * @returns {boolean}
+ */
+function isValidToken(provided) {
+  if (!provided) return false;
+  const a = Buffer.from(String(provided), 'utf8');
+  const b = Buffer.from(AUTH_TOKEN, 'utf8');
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
+
+/**
+ * Pull the bearer token from Authorization, X-Bridge-Token, or ?token=.
+ * The query form exists for WebSocket clients that cannot set headers; it is
+ * the weakest of the three because URLs land in logs, so prefer a header.
+ * @param {import('node:http').IncomingMessage} req
+ * @returns {string | null}
+ */
+function extractToken(req) {
+  const auth = req.headers['authorization'];
+  if (typeof auth === 'string' && auth.toLowerCase().startsWith('bearer ')) {
+    return auth.slice(7).trim();
+  }
+  const header = req.headers['x-bridge-token'];
+  if (typeof header === 'string' && header.trim()) return header.trim();
+  try {
+    const url = new URL(req.url || '/', 'http://127.0.0.1');
+    const q = url.searchParams.get('token');
+    if (q) return q;
+  } catch {
+    /* ignore malformed request targets */
+  }
+  return null;
+}
+
+/**
+ * Request path with any query string stripped.
+ * @param {import('node:http').IncomingMessage} req
+ * @returns {string}
+ */
+function pathOf(req) {
+  try {
+    return new URL(req.url || '/', 'http://127.0.0.1').pathname;
+  } catch {
+    return '/';
+  }
+}
+
+/**
+ * Apply the Host / Origin / token gate to an HTTP request.
+ * Writes the rejection itself and returns false when the request is refused.
+ * @param {import('node:http').IncomingMessage} req
+ * @param {import('node:http').ServerResponse} res
+ * @param {{ requireAuth?: boolean }} [options]
+ * @returns {boolean} true if the handler may proceed
+ */
+function passesHttpGate(req, res, options = {}) {
+  const { requireAuth = true } = options;
+
+  const deny = (status, error) => {
+    res.writeHead(status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error }));
+  };
+
+  if (!isLoopbackHost(req.headers.host)) {
+    console.warn(`[SEC] Rejected request with non-loopback Host: ${req.headers.host}`);
+    deny(403, 'Invalid Host header — this service is loopback only');
+    return false;
+  }
+  if (isBrowserOrigin(req.headers.origin)) {
+    console.warn(`[SEC] Rejected browser-origin request from ${req.headers.origin} to ${pathOf(req)}`);
+    deny(403, 'Requests from web pages are not accepted');
+    return false;
+  }
+  if (requireAuth && !isValidToken(extractToken(req))) {
+    console.warn(`[SEC] Rejected unauthenticated request to ${pathOf(req)}`);
+    deny(401, `Missing or invalid bridge token — read it from ${TOKEN_FILE}`);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Read a request body, refusing anything oversized.
+ * @param {import('node:http').IncomingMessage} req
+ * @returns {Promise<string>}
+ */
+async function readBody(req) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > MAX_BODY_BYTES) {
+      req.destroy();
+      throw new Error(`Request body exceeds ${MAX_BODY_BYTES} bytes`);
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+/**
+ * Publish port + token for the local agent, readable only by this user.
+ * @param {number} port
+ */
+function writeSessionFile(port) {
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+  const payload = {
+    service: SERVICE_ID,
+    port,
+    token: AUTH_TOKEN,
+    pid: process.pid,
+    startedAt: Date.now(),
+  };
+  // Remove first: the mode argument only applies when the file is created.
+  rmSync(SESSION_FILE, { force: true });
+  rmSync(TOKEN_FILE, { force: true });
+  writeFileSync(SESSION_FILE, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+  writeFileSync(TOKEN_FILE, `${AUTH_TOKEN}\n`, { mode: 0o600 });
+}
+
+let sessionFileWritten = false;
+
+function cleanupSessionFile() {
+  if (!sessionFileWritten) return;
+  sessionFileWritten = false;
+  try {
+    rmSync(SESSION_FILE, { force: true });
+    rmSync(TOKEN_FILE, { force: true });
+  } catch {
+    /* best effort on shutdown */
+  }
+}
+
+process.on('exit', cleanupSessionFile);
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(signal, () => {
+    cleanupSessionFile();
+    process.exit(0);
+  });
+}
 
 // ─── Port Detection ─────────────────────────────────────────────────
 
@@ -86,6 +336,10 @@ function isPortInUse(port) {
 /**
  * Check if a port is already running our bridge service.
  * Sends HTTP GET /health and verifies { service: "easyeda-bridge" }.
+ *
+ * NOTE: this is advisory only. Any local process can answer with our service
+ * string, so a squatter can make us stand down and take our place. Set
+ * EASYEDA_BRIDGE_NO_SINGLETON=1 to skip the check and always bind our own port.
  * @param {number} port
  * @returns {Promise<boolean>}
  */
@@ -133,34 +387,37 @@ async function findAvailablePort() {
 
 // ─── HTTP Server (for AI to submit code via HTTP POST) ─────────────
 const httpServer = createServer(async (req, res) => {
-  // CORS
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
+  // No CORS headers are emitted: browsers must not be able to read our
+  // responses, and a preflight that receives no Access-Control-Allow-Origin
+  // fails closed.
   if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    res.end();
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Cross-origin requests are not supported' }));
     return;
   }
 
-  // Health check — includes service identifier for client handshake verification
-  if (req.method === 'GET' && req.url === '/health') {
+  const path = pathOf(req);
+
+  // Health check — includes service identifier for client handshake verification.
+  // Unauthenticated so both the agent and the EDA extension can discover the
+  // port, but still Host/Origin gated, and it no longer leaks window IDs.
+  if (req.method === 'GET' && path === '/health') {
+    if (!passesHttpGate(req, res, { requireAuth: false })) return;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       service: SERVICE_ID,
       status: 'ok',
       edaConnected: edaClients.size > 0,
       edaWindowCount: edaClients.size,
-      activeWindowId: activeEdaWindowId,
-      pendingRequests: pendingRequests.size,
+      authRequired: true,
       timestamp: Date.now(),
     }));
     return;
   }
 
   // List all connected EDA windows
-  if (req.method === 'GET' && req.url === '/eda-windows') {
+  if (req.method === 'GET' && path === '/eda-windows') {
+    if (!passesHttpGate(req, res)) return;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     const windows = [];
     for (const [windowId, ws] of edaClients) {
@@ -179,43 +436,50 @@ const httpServer = createServer(async (req, res) => {
   }
 
   // Set active EDA window
-  if (req.method === 'POST' && req.url === '/eda-windows/select') {
-    let body = '';
-    for await (const chunk of req) body += chunk;
+  if (req.method === 'POST' && path === '/eda-windows/select') {
+    if (!passesHttpGate(req, res)) return;
+    let payload;
     try {
-      const payload = JSON.parse(body);
-      const { windowId } = payload;
-      if (!edaClients.has(windowId)) {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: `EDA window "${windowId}" not found` }));
-        return;
-      }
-      activeEdaWindowId = windowId;
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ success: true, activeWindowId }));
-    }
-    catch {
+      payload = JSON.parse(await readBody(req));
+    } catch (err) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Invalid request body' }));
+      res.end(JSON.stringify({ error: `Invalid request body: ${err.message}` }));
+      return;
     }
+
+    const { windowId } = payload;
+    if (!edaClients.has(windowId)) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `EDA window "${windowId}" not found` }));
+      return;
+    }
+    activeEdaWindowId = windowId;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true, activeWindowId: activeEdaWindowId }));
     return;
   }
 
   // Execute code on EDA
-  if (req.method === 'POST' && req.url === '/execute') {
-    let body = '';
-    for await (const chunk of req) body += chunk;
+  if (req.method === 'POST' && path === '/execute') {
+    if (!passesHttpGate(req, res)) return;
+    let payload;
+    try {
+      payload = JSON.parse(await readBody(req));
+    } catch (err) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `Invalid request body: ${err.message}` }));
+      return;
+    }
+
+    const code = payload.code;
+    const windowId = payload.windowId; // optional, uses active window if not specified
+    if (!code || typeof code !== 'string') {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing "code" field (string)' }));
+      return;
+    }
 
     try {
-      const payload = JSON.parse(body);
-      const code = payload.code;
-      const windowId = payload.windowId; // optional, uses active window if not specified
-      if (!code || typeof code !== 'string') {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Missing "code" field (string)' }));
-        return;
-      }
-
       const result = await executeOnEda(code, windowId);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true, result, windowId: windowId || activeEdaWindowId }));
@@ -232,10 +496,48 @@ const httpServer = createServer(async (req, res) => {
 });
 
 // ─── WebSocket Server ───────────────────────────────────────────────
-const wss = new WebSocketServer({ server: httpServer });
+// WebSockets are exempt from the same-origin policy, so the HTTP gate above
+// buys nothing here — the upgrade must be checked independently.
+const wss = new WebSocketServer({
+  server: httpServer,
+  verifyClient: ({ req, origin }, done) => {
+    const path = pathOf(req);
+
+    if (!isLoopbackHost(req.headers.host)) {
+      console.warn(`[SEC] Rejected WS upgrade with non-loopback Host: ${req.headers.host}`);
+      done(false, 403, 'Invalid Host header');
+      return;
+    }
+
+    if (path === '/eda') {
+      // The EDA extension cannot carry a token, so this path is gated on origin
+      // alone: the desktop client sends none, the web client sends an official one.
+      if (!isAllowedEdaOrigin(origin)) {
+        console.warn(`[SEC] Rejected EDA WS upgrade from disallowed origin: ${origin}`);
+        done(false, 403, 'Origin not allowed for the EDA endpoint');
+        return;
+      }
+      done(true);
+      return;
+    }
+
+    // Agent path: no browsers, and a valid token.
+    if (isBrowserOrigin(origin)) {
+      console.warn(`[SEC] Rejected agent WS upgrade from browser origin: ${origin}`);
+      done(false, 403, 'Requests from web pages are not accepted');
+      return;
+    }
+    if (!isValidToken(extractToken(req))) {
+      console.warn('[SEC] Rejected agent WS upgrade with missing or invalid token');
+      done(false, 401, 'Missing or invalid bridge token');
+      return;
+    }
+    done(true);
+  },
+});
 
 wss.on('connection', (ws, req) => {
-  const clientType = req.url === '/eda' ? 'eda' : 'agent';
+  const clientType = pathOf(req) === '/eda' ? 'eda' : 'agent';
   console.log(`[WS] New ${clientType} connection from ${req.socket.remoteAddress}`);
 
   // Send handshake message for client verification
@@ -253,6 +555,15 @@ wss.on('connection', (ws, req) => {
       try {
         const msg = JSON.parse(raw.toString());
         if (msg.type === 'register' && msg.windowId) {
+          // Window IDs are client-asserted, so a second client claiming a live
+          // ID would silently displace the real window and receive the code
+          // meant for it. First registration wins until it disconnects.
+          const existing = edaClients.get(msg.windowId);
+          if (existing && existing !== ws && existing.readyState === 1) {
+            console.warn(`[SEC] Refused duplicate registration for live window: ${msg.windowId}`);
+            ws.close(4009, 'windowId already registered');
+            return;
+          }
           // EDA client registering with window ID
           registeredWindowId = msg.windowId;
           edaClients.set(registeredWindowId, ws);
@@ -274,16 +585,19 @@ wss.on('connection', (ws, req) => {
     ws.on('close', (code, reason) => {
       console.log(`[WS] EDA window disconnected: ${registeredWindowId} (${code} ${reason})`);
       if (registeredWindowId) {
-        edaClients.delete(registeredWindowId);
+        // Only drop the map entry if it is still ours.
+        if (edaClients.get(registeredWindowId) === ws) {
+          edaClients.delete(registeredWindowId);
+        }
         if (activeEdaWindowId === registeredWindowId) {
           // Select another window if available
           activeEdaWindowId = edaClients.keys().next().value || null;
         }
         // Reject pending requests for this window
-        for (const [id, req] of pendingRequests) {
-          if (req.windowId === registeredWindowId) {
-            clearTimeout(req.timer);
-            req.reject(new Error(`EDA window "${registeredWindowId}" disconnected`));
+        for (const [id, pending] of pendingRequests) {
+          if (pending.windowId === registeredWindowId) {
+            clearTimeout(pending.timer);
+            pending.reject(new Error(`EDA window "${registeredWindowId}" disconnected`));
             pendingRequests.delete(id);
           }
         }
@@ -428,6 +742,11 @@ function handleEdaMessage(msg, windowId) {
   if (msg.type === 'result' || msg.type === 'error') {
     const pending = pendingRequests.get(msg.id);
     if (pending) {
+      // A result may only settle a request that was routed to this window.
+      if (pending.windowId !== windowId) {
+        console.warn(`[SEC] Dropped ${msg.type} for request ${msg.id} from unexpected window ${windowId}`);
+        return;
+      }
       clearTimeout(pending.timer);
       pendingRequests.delete(msg.id);
       if (msg.type === 'result') {
@@ -446,15 +765,29 @@ function handleEdaMessage(msg, windowId) {
 async function start() {
   try {
     // ── Singleton check: exit if an identical bridge is already running ──
-    const existingPort = await findExistingInstance();
-    if (existingPort) {
-      console.log(`✅ Bridge server is already running on port ${existingPort}, no need to start another instance.`);
-      process.exit(0);
+    if (process.env.EASYEDA_BRIDGE_NO_SINGLETON !== '1') {
+      const existingPort = await findExistingInstance();
+      if (existingPort) {
+        console.log(`✅ Bridge server is already running on port ${existingPort}, no need to start another instance.`);
+        process.exit(0);
+      }
     }
 
     const port = await findAvailablePort();
 
     httpServer.listen(port, LISTEN_HOST, () => {
+      try {
+        writeSessionFile(port);
+        sessionFileWritten = true;
+      } catch (err) {
+        // Without the token file the agent has no way to authenticate, so a
+        // failure here is fatal unless the token was pinned via the environment.
+        console.error(`\u274c Failed to write ${SESSION_FILE}: ${err.message}`);
+        if (!process.env.EASYEDA_BRIDGE_TOKEN) {
+          console.error('   Set EASYEDA_BRIDGE_TOKEN to supply a token out of band, or fix the path above.');
+          process.exit(1);
+        }
+      }
       console.log(`
 ╔══════════════════════════════════════════════════════════════╗
 ║         EasyEDA WebSocket Bridge Server                      ║
@@ -478,6 +811,12 @@ ${formatBannerLine('Service ID', SERVICE_ID)}
 ║    WS sends { type: "handshake", service: "..." }            ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
+
+🔐 Auth required on /execute, /eda-windows and ws://.../agent
+   Token file : ${TOKEN_FILE}
+   Session    : ${SESSION_FILE}
+   Usage      : curl -H "Authorization: Bearer $(cat ${TOKEN_FILE})" ...
+   Browser-origin requests and non-loopback Host headers are refused.
       `);
     });
 

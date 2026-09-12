@@ -101,6 +101,19 @@ fi
 echo "Bridge running on port: ${BRIDGE_PORT:-unknown}"
 ```
 
+### 3b. Load the bridge token
+
+The bridge requires a bearer token on every endpoint except `/health`, and refuses
+requests that carry a browser `Origin` or a non-loopback `Host`. The token is minted
+per run and written to `~/.easyeda-bridge/token` (mode 0600):
+
+```bash
+BRIDGE_TOKEN=$(cat ~/.easyeda-bridge/token)
+```
+
+Pass it as `-H "Authorization: Bearer $BRIDGE_TOKEN"` on every request below.
+A `401` means the bridge restarted and minted a new token — re-read the file.
+
 ### 4. Connect EasyEDA
 
 Install the `run-api-gateway.eext` extension in EasyEDA Pro. Download link:
@@ -112,11 +125,12 @@ After the extension is loaded, it will automatically establish the WebSocket con
 ### 5. Verify connection and select EDA window
 
 ```bash
-# Check bridge and EDA connection status
+# Check bridge and EDA connection status (no token needed on /health)
 curl http://localhost:${BRIDGE_PORT:-49620}/health
 
 # List all connected EDA windows
-curl http://localhost:${BRIDGE_PORT:-49620}/eda-windows
+curl -H "Authorization: Bearer $BRIDGE_TOKEN" \
+  http://localhost:${BRIDGE_PORT:-49620}/eda-windows
 ```
 
 The `/eda-windows` response looks like:
@@ -146,6 +160,7 @@ The `/eda-windows` response looks like:
 **Select a window**:
 ```bash
 curl -X POST http://localhost:${BRIDGE_PORT}/eda-windows/select \
+  -H "Authorization: Bearer $BRIDGE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"windowId": "abc-123"}'
 ```
@@ -156,6 +171,7 @@ After selection, confirm: "✅ Active EDA window: abc-123. Ready to work."
 
 ```bash
 curl -X POST http://localhost:${BRIDGE_PORT:-49620}/execute \
+  -H "Authorization: Bearer $BRIDGE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"code": "return await eda.dmt_Project.getCurrentProjectInfo();"}'
 ```
@@ -653,16 +669,20 @@ When multiple EasyEDA windows are connected to the bridge, you do NOT need to ch
 
 **Multi-window operations:**
 ```bash
+BRIDGE_TOKEN=$(cat ~/.easyeda-bridge/token)
+
 # List all connected EDA windows
-curl http://localhost:49620/eda-windows
+curl -H "Authorization: Bearer $BRIDGE_TOKEN" http://localhost:49620/eda-windows
 
 # Select a specific window
 curl -X POST http://localhost:49620/eda-windows/select \
+  -H "Authorization: Bearer $BRIDGE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"windowId": "abc-123-def"}'
 
 # Execute on specific window
 curl -X POST http://localhost:49620/execute \
+  -H "Authorization: Bearer $BRIDGE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"code": "return await eda.dmt_Project.getCurrentProjectInfo();", "windowId": "abc-123-def"}'
 ```
@@ -684,8 +704,9 @@ If only one EDA window is connected, it's automatically selected as active.
 4. **Check return values**: Many methods return `null` on failure — always validate
 5. **Layer numbers**: Use enums from `references/enums/` docs (e.g., `EPCB_LayerId`)
 6. **EDA window disconnected**: If you get an error about a window being disconnected, use `GET /eda-windows` to check available windows and `POST /eda-windows/select` to switch to another window
-7. **Permission errors**: All API interfaces are controlled by EDA's permission system. If a specific API consistently fails to execute (returns error or null) while other APIs work fine, and you've confirmed the call matches the documentation exactly, it may be **blocked by permissions** — not a code bug. The EDA client may restrict certain operations based on user license, project settings, or document state. Inform the user that the operation may require elevated permissions or a different EDA edition.
-8. **Persistent errors?**: If you've verified the API call matches the documentation exactly, ruled out permission issues, and still encounter unexpected errors, consider reporting the issue through official EasyEDA support channels
+7. **`401 Missing or invalid bridge token`**: Re-read `~/.easyeda-bridge/token` — the bridge mints a new token each start. `403 Invalid Host header` / `403 Requests from web pages are not accepted` mean the request looked like it came from a browser; call the bridge from the shell, addressing it as `localhost` or `127.0.0.1`.
+8. **Permission errors**: All API interfaces are controlled by EDA's permission system. If a specific API consistently fails to execute (returns error or null) while other APIs work fine, and you've confirmed the call matches the documentation exactly, it may be **blocked by permissions** — not a code bug. The EDA client may restrict certain operations based on user license, project settings, or document state. Inform the user that the operation may require elevated permissions or a different EDA edition.
+9. **Persistent errors?**: If you've verified the API call matches the documentation exactly, ruled out permission issues, and still encounter unexpected errors, consider reporting the issue through official EasyEDA support channels
 
 ### Failure Handling Rules
 
