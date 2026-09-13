@@ -46,6 +46,13 @@ skill under `~/.claude/skills`. It prints a plan and requires an explicit `y` on
 real terminal first; a piped stdin is refused rather than treated as consent. It
 never starts the bridge.
 
+`scripts/start-bridge.sh` — starts the bridge detached (its own session, reparented
+to init, output appended to `~/.easyeda-bridge/bridge.log`) so it survives the shell and
+any agent harness that reaps background tasks under memory pressure. It refuses to start
+a second bridge, and offers `status`, `stop` and `restart`. It is deliberately manual:
+nothing installs it as a service, because an always-on bridge is an always-open RCE
+channel into the EDA client.
+
 `SKILL.md` also gained an **Untrusted Content & Prompt Injection** section. Results from
 `/execute` carry text from shared projects, third-party library entries and document fields,
 all of it attacker-controllable, and the agent reading those results is the one component
